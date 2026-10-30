@@ -1,0 +1,46 @@
+{
+  "manifest_version": 2,
+  "id": "github.winincorce-a11y.talk-rate",
+  "version": "1.1.1",
+  "name": "发言频率控制",
+  "description": "把群聊回复频率精确控制到 0：可以设置某个群只有被 @ 才回复，平时的聊天内容完全不触发回复；也支持任意概率、逐群规则与热更新。",
+  "author": {
+    "name": "winincorce-a11y",
+    "url": "https://github.com/winincorce-a11y"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/winincorce-a11y/mai-talk-rate",
+    "homepage": "https://github.com/winincorce-a11y/mai-talk-rate",
+    "documentation": "https://github.com/winincorce-a11y/mai-talk-rate/blob/main/README.md",
+    "issues": "https://github.com/winincorce-a11y/mai-talk-rate/issues"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.19.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "message-square-dashed",
+      "fallback": "message-circle",
+      "background": "#1f2937"
+    }
+  },
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "changelog": "CHANGELOG.md"
+}

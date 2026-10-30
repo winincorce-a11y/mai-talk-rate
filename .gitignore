@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.tmp/
+tests/.tmp/
+.pytest_cache/
+config.toml
+state.json
+
+tests/.**.py
