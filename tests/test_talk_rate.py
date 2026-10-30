@@ -1026,6 +1026,34 @@ def test_command_falls_back_to_group_id_when_session_fails() -> None:
         assert "123" in targets
 
 
+def test_group_command_reply_never_falls_back_to_member_qq() -> None:
+    """回归：群聊里 session_id 与群号都失败时，不能把规则文本发到成员私聊。"""
+
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(data_dir)
+        payload = _message_payload(group_id="123", user_id="1242973939")
+        session_id = payload["message"]["session_id"]
+        # 让 session_id 与群号都发不出去
+        plugin.ctx.send = _Send(fail_targets=(session_id, "123"))
+        _run(plugin.cmd_talk_rate(**payload))
+
+        targets = [c[0] for c in plugin.ctx.send.calls]
+        assert "1242973939" not in targets, f"误把命令结果发到成员私聊: {targets}"
+
+
+def test_private_command_reply_may_use_user_id() -> None:
+    """私聊场景仍应允许用 user_id 作为发送目标。"""
+
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(data_dir)
+        payload = _message_payload(user_id="555", text="/tr")
+        payload["matched_groups"] = {"action": "", "arg": ""}
+        plugin.ctx.send = _Send(fail_targets=(payload["message"]["session_id"],))
+        _run(plugin.cmd_talk_rate(**payload))
+        targets = [c[0] for c in plugin.ctx.send.calls]
+        assert "555" in targets, targets
+
+
 def test_command_reply_is_exempt_from_outbound_gate() -> None:
     """命令回复不能被我自己的出站闸门拦掉。"""
 
@@ -1159,6 +1187,7 @@ def test_config_fields_have_chinese_labels_and_descriptions() -> None:
         ("plugin", tr.PluginSectionConfig),
         ("default_rule", tr.DefaultRuleConfig),
         ("group_rules", tr.GroupRuleConfig),
+        ("outbound_guard", tr.OutboundGuardConfig),
     ]
 
     problems: list[str] = []

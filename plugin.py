@@ -1326,8 +1326,9 @@ class TalkRatePlugin(MaiBotPlugin):
     async def _reply(self, chat: "ChatRef", text: str, level: int, success: bool) -> None:
         """把命令结果主动发到 QQ。
 
-        多路兜底：``stream_id`` → ``chat_id`` → ``group_id``，
-        取第一个发送成功的。发送失败不影响命令本身的结果。
+        群聊只回退到 ``chat_id`` / ``group_id``；私聊才用 ``user_id``。
+        否则群聊里两者都失败时会退到发言人 QQ 号，把频率规则这类运维文本
+        发到与该成员的私聊流里——那是用户没预期的地方。
         """
 
         del success, level  # 目前所有分支都发送，保留参数便于以后分级
@@ -1335,7 +1336,11 @@ class TalkRatePlugin(MaiBotPlugin):
             return
 
         targets: list[str] = []
-        for candidate in (chat.chat_id, chat.group_id, chat.user_id):
+        candidates = (chat.chat_id, chat.group_id, chat.user_id) if chat.is_private else (
+            chat.chat_id,
+            chat.group_id,
+        )
+        for candidate in candidates:
             if candidate and candidate not in targets:
                 targets.append(candidate)
         if not targets:
