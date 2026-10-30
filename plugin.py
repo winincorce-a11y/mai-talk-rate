@@ -32,8 +32,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional
 
+import contextlib
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -75,12 +77,15 @@ _CONTROL_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 以斜杠开头：主流命令写法。
-_SLASH_COMMAND_RE = re.compile(r"^\s*[/／]\s*\S")
+#: 以斜杠开头、且斜杠后面紧跟「命令名首字符」的写法。
+#: 之所以要求紧跟字符而不是 ``\S``，是为了排除 ``//哈哈`` 这类闲聊——
+#: 旧写法会让任意 ``/`` 开头的闲聊都打开命令豁免窗口。
+_SLASH_COMMAND_RE = re.compile(r"^\s*[/／]\s*[A-Za-z0-9_\-\u4e00-\u9fff]")
 
-#: 常见「不带斜杠」的命令触发词。第三方插件里有大量这种写法
+#: 常见「不带斜杠」的命令触发词默认值。第三方插件里有大量这种写法
 #: （例如随机图片插件的 ``随机图片`` / ``来张图``），不能只认斜杠。
-_BARE_COMMAND_WORDS = (
+#: 用户可以在配置文件里追加，避免硬编码漏判。
+_DEFAULT_COMMAND_KEYWORDS = (
     "随机图片",
     "来张图",
     "来点图",
@@ -94,15 +99,13 @@ _BARE_COMMAND_WORDS = (
     "签到",
     "今日运势",
     "画图",
-    "骂我",
-    "赞我",
 )
 
 
-def _looks_like_command(text: str) -> bool:
+def _looks_like_command(text: str, keywords: "Iterable[str]" = ()) -> bool:
     """判断这条消息看起来像不像是某个插件的命令。
 
-    这里宁可**宽进**：把普通聊天误判成命令，最坏结果是这一条不静默；
+    宁可**宽进**：把普通聊天误判成命令，最坏结果是这一条不静默；
     把命令漏判成聊天，会导致别的插件功能整体失效——后者严重得多。
     """
 
@@ -112,8 +115,9 @@ def _looks_like_command(text: str) -> bool:
     if _SLASH_COMMAND_RE.match(stripped):
         return True
     lowered = stripped.lower()
-    for word in _BARE_COMMAND_WORDS:
-        if lowered.startswith(word.lower()):
+    for word in keywords:
+        word = str(word).strip()
+        if word and lowered.startswith(word.lower()):
             return True
     return False
 
@@ -136,6 +140,24 @@ def _has_media_segment(message: Any) -> bool:
         if str(item.get("type") or "").strip().lower() in _MEDIA_SEGMENT_TYPES:
             return True
     return False
+
+
+def _preview_text(message: Any, limit: int = 60) -> str:
+    """截取一段出站文本用于日志，避免刷屏或泄漏过长内容。"""
+
+    if not isinstance(message, dict):
+        return ""
+    text = _as_str(message.get("processed_plain_text"))
+    if not text:
+        raw = message.get("raw_message")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict) and str(item.get("type") or "") == "text":
+                    text = _as_str(item.get("data"))
+                    if text:
+                        break
+    text = text.replace("\n", " ")
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -402,9 +424,10 @@ _INBOUND_MEMORY_TTL_SECONDS = 180.0
 #: 每个会话最多缓存多少条入站判定，避免无界增长。
 _INBOUND_MEMORY_MAX_SESSIONS = 2000
 
-#: 命令回复的豁免有效期。命令可能分多条发送（先回执、再结果、最后总结），
+#: 命令豁免窗口的默认值（秒）。命令可能分多条发送（先回执、再结果、最后总结），
 #: 每次命中都会顺延窗口，避免第二条消息被出站闸门吞掉。
-_CONTROL_REPLY_WINDOW_SECONDS = 120.0
+#: 实际取值来自配置 ``outbound_guard.command_window_seconds``。
+_DEFAULT_COMMAND_WINDOW_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +571,61 @@ class GroupRuleConfig(PluginConfigBase):
     )
 
 
+class OutboundGuardConfig(PluginConfigBase):
+    """出站闸门：真正拦住「不该说的闲聊回复」。"""
+
+    __ui_label__ = "出站闸门"
+    __ui_icon__ = "shield"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "总开关。关闭后插件只做入站判定与状态记录，不再拦截任何出站消息。\n"
+            "如果你发现某个插件的结果被误拦，可以先关掉它来确认是不是这里的问题。"
+        ),
+        json_schema_extra={"label": "启用出站拦截"},
+    )
+    command_keywords: str = Field(
+        default="",
+        description=(
+            "额外把哪些开头词视为「其他插件的命令」，从而放行它们的输出。\n"
+            "以斜杠开头的命令（/xxx）总是自动放行，无需在此登记。\n"
+            "这里用于补充**不带斜杠**的触发词，例如随机图片插件的「随机图片」「来张图」。\n"
+            "一行一个或用逗号分隔；留空则只使用插件内置的常见触发词。"
+        ),
+        json_schema_extra={
+            "label": "额外命令触发词",
+            "x-widget": "textarea",
+            "rows": 4,
+            "placeholder": "随机图片\n来张图\n点歌",
+            "hint": "补上你自己装的插件的触发词，避免它们的输出被误拦",
+        },
+    )
+    command_window_seconds: int = Field(
+        default=60,
+        description=(
+            "识别到命令后，多长时间内的出站消息视为该命令的结果并放行。\n"
+            "命令常常先回一条「正在查询」再发结果，下载类还要补总结，所以需要一段窗口。\n"
+            "调小可以减少误放行，调大可以避免长任务的结果被拦。"
+        ),
+        json_schema_extra={
+            "label": "命令豁免窗口（秒）",
+            "min": 5,
+            "max": 600,
+            "step": 5,
+            "hint": "建议 30 ～ 120 秒",
+        },
+    )
+
+
 class TalkRateConfig(PluginConfigBase):
     """发言频率控制插件的完整配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     default_rule: DefaultRuleConfig = Field(default_factory=DefaultRuleConfig)
     group_rules: GroupRuleConfig = Field(default_factory=GroupRuleConfig)
+    outbound_guard: OutboundGuardConfig = Field(default_factory=OutboundGuardConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -779,17 +851,47 @@ class TalkRatePlugin(MaiBotPlugin):
         try:
             self._state = RateState.from_dict(json.loads(path.read_text(encoding="utf-8")))
         except Exception:
-            self._logger().warning("发言频率控制：状态文件读取失败，已忽略 %s", path)
+            # 不要静默丢掉用户设置：把坏文件留档，并明确告知恢复方式。
+            backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            moved = False
+            try:
+                path.replace(backup)
+                moved = True
+            except Exception:
+                pass
+            if moved:
+                self._logger().error(
+                    "发言频率控制：状态文件无法解析，已备份为 %s，本次以空状态启动；"
+                    "修复该文件并重命名回 %s 即可恢复之前的临时设置",
+                    backup,
+                    path.name,
+                )
+            else:
+                self._logger().error(
+                    "发言频率控制：状态文件无法解析且无法备份（%s），本次以空状态启动", path
+                )
 
     def _save_state(self) -> None:
+        """原子写入状态文件：先写临时文件再 ``os.replace``。
+
+        直接 ``write_text`` 覆盖时，进程在写到一半崩溃会留下半截 JSON，
+        下次启动就读不回来，用户视角是「我设的规则莫名没了」。
+        """
+
         path = self._state_path()
         if path is None:
             return
+        tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(self._state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.write_text(
+                json.dumps(self._state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp_path, path)
         except Exception:
-            self._logger().warning("发言频率控制：状态保存失败 %s", path)
+            self._logger().error("发言频率控制：状态保存失败 %s", path)
+            with contextlib.suppress(Exception):
+                tmp_path.unlink(missing_ok=True)
 
     # -- 核心判定 -----------------------------------------------------------
 
@@ -874,12 +976,35 @@ class TalkRatePlugin(MaiBotPlugin):
 
     # -- 控制回复豁免 -------------------------------------------------------
 
-    def _mark_control_reply(self, session_id: str) -> None:
-        """登记「接下来这条出站是本插件自己的命令回复」。"""
+    def _command_window_seconds(self) -> float:
+        """命令豁免窗口长度，取自配置并做上下限保护。"""
+
+        raw = _cfg_get(self.config.outbound_guard, "command_window_seconds", 60)
+        value = _as_float(raw)
+        if value is None:
+            return _DEFAULT_COMMAND_WINDOW_SECONDS
+        return max(5.0, min(600.0, value))
+
+    def _command_keywords(self) -> list[str]:
+        """内置常见触发词 + 用户追加的触发词。"""
+
+        extra = parse_keywords(_cfg_get(self.config.outbound_guard, "command_keywords", ""))
+        merged: list[str] = []
+        for word in (*_DEFAULT_COMMAND_KEYWORDS, *extra):
+            if word and word not in merged:
+                merged.append(word)
+        return merged
+
+    def _outbound_guard_enabled(self) -> bool:
+        return _as_bool(_cfg_get(self.config.outbound_guard, "enabled", True), True)
+
+    def _mark_control_reply(self, session_id: str, seconds: Optional[float] = None) -> None:
+        """登记「接下来这段时间的出站属于命令/本插件的回复」。"""
 
         if not session_id:
             return
-        self._control_reply_until[session_id] = time.time() + _CONTROL_REPLY_WINDOW_SECONDS
+        window = self._command_window_seconds() if seconds is None else seconds
+        self._control_reply_until[session_id] = time.time() + window
         if len(self._control_reply_until) > _INBOUND_MEMORY_MAX_SESSIONS:
             now = time.time()
             for key in [k for k, v in self._control_reply_until.items() if v < now]:
@@ -889,8 +1014,7 @@ class TalkRatePlugin(MaiBotPlugin):
         """判断这条出站是否属于命令回复；命中后不消费，而是顺延豁免窗口。
 
         命令/插件常常先发一条「正在查询」，几秒后再发结果，下载任务还会在
-        图片之后补一条总结。旧实现命中一次就 ``pop``，第二条消息会被出站
-        闸门当成主动闲聊拦掉，所以这里改成「只要还在窗口内就继续顺延」。
+        图片之后补一条总结。命中一次就 ``pop`` 会导致第二条消息被当成主动闲聊拦掉。
         """
 
         if not session_id:
@@ -902,7 +1026,7 @@ class TalkRatePlugin(MaiBotPlugin):
         if now > deadline:
             self._control_reply_until.pop(session_id, None)
             return False
-        self._control_reply_until[session_id] = now + _CONTROL_REPLY_WINDOW_SECONDS
+        self._control_reply_until[session_id] = now + self._command_window_seconds()
         return True
 
     # -- Hook：入站闸门 -----------------------------------------------------
@@ -943,7 +1067,7 @@ class TalkRatePlugin(MaiBotPlugin):
 
             # 命令消息：它的输出属于「别的插件/主程序在干活」，不是麦麦在闲聊。
             # 记一个豁免，否则零频率会话会把别人的命令结果一起吞掉。
-            if _looks_like_command(chat.text):
+            if _looks_like_command(chat.text, self._command_keywords()):
                 target = chat.chat_id or chat.primary_key
                 self._mark_control_reply(target)
                 self._logger().debug("发言频率控制：识别为命令，放行其输出（%s）", target)
@@ -1034,6 +1158,8 @@ class TalkRatePlugin(MaiBotPlugin):
             self._load_state()
             if not self._enabled():
                 return {"action": "continue"}
+            if not self._outbound_guard_enabled():
+                return {"action": "continue"}
 
             # 只处理出站消息；其它调用（无 message）直接放行。
             if not isinstance(kwargs.get("message"), dict):
@@ -1044,9 +1170,9 @@ class TalkRatePlugin(MaiBotPlugin):
             )
             chat = ChatRef.from_payload(kwargs)
 
-            # 命令结果由本插件自己发出，必须豁免，否则「/tr」永远收不到回复。
+            # 命令结果（含本插件自己的）必须豁免，否则命令永远收不到回复。
             if self._is_control_reply(stream_id):
-                self._logger().debug("发言频率控制：放行本插件自己的命令回复（%s）", stream_id)
+                self._logger().debug("发言频率控制：放行命令回复（%s）", stream_id)
                 return {"action": "continue"}
 
             # 非文本出站（图片、表情、转发、语音）几乎都来自别的插件的命令结果，
@@ -1073,7 +1199,16 @@ class TalkRatePlugin(MaiBotPlugin):
 
             self._stats["silenced"] += 1
             self._last_reason = reason
-            self._logger().info("发言频率控制：取消一条出站消息（%s）", reason)
+            # 用 warning 而不是 info：万一误拦了别的插件，用户能直接看到是哪条消息，
+            # 也便于按提示往「额外命令触发词」里补词。
+            self._logger().warning(
+                "发言频率控制：取消一条出站消息（%s）｜会话=%s｜内容=%r。"
+                "若这是其他插件的结果而非麦麦的闲聊，请把它的触发词加到「额外命令触发词」，"
+                "或关闭「启用出站拦截」",
+                reason,
+                stream_id,
+                _preview_text(kwargs.get("message")),
+            )
             return {"action": "abort"}
         except Exception:
             self._logger().exception("发言频率控制：出站判定异常，放行本条消息")

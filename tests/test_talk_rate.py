@@ -164,13 +164,16 @@ class _Section:
 
 
 class _Config:
-    """插件配置桩：三个小节，缺省值对齐 plugin.py 的默认声明。"""
+    """插件配置桩：四个小节，缺省值对齐 plugin.py 的默认声明。"""
 
     def __init__(self, **overrides) -> None:
-        self.plugin = _Section(enabled=True, config_version="1.0.0")
+        self.plugin = _Section(enabled=True, config_version="1.1.0")
         self.default_rule = _Section(group_rate="default", private_rate="default", blocked_whitelist="")
         self.group_rules = _Section(
             rules="", at_bypass=True, keywords="", keyword_match="contains", keyword_case_sensitive=False
+        )
+        self.outbound_guard = _Section(
+            enabled=True, command_keywords="", command_window_seconds=60
         )
         for name, values in overrides.items():
             section = getattr(self, name)
@@ -719,10 +722,99 @@ def test_outbound_fails_open_without_memory_in_normal_group() -> None:
 def test_looks_like_command_detection() -> None:
     """命令识别必须覆盖「不带斜杠」的第三方触发词。"""
 
+    words = tr._DEFAULT_COMMAND_KEYWORDS
     for text in ("/tr 0", "/clear", "随机图片", "来张图", "涩图", "setu 3", "点歌 晴天"):
-        assert tr._looks_like_command(text), text
+        assert tr._looks_like_command(text, words), text
     for text in ("今天天气不错", "麦麦你好", ""):
-        assert not tr._looks_like_command(text), text
+        assert not tr._looks_like_command(text, words), text
+
+
+def test_double_slash_chat_is_not_a_command() -> None:
+    """回归：``//哈哈`` 这类闲聊不能被当成命令，否则会开出豁免窗口。"""
+
+    words = tr._DEFAULT_COMMAND_KEYWORDS
+    for text in ("//哈哈", "／／这不算命令", "//"):
+        assert not tr._looks_like_command(text, words), text
+    # 正常的斜杠命令仍然要能识别（含「斜杠后带空格」的写法，如 `/ tr`）
+    for text in ("/tr", "/help", "／发言频率", "/ tr"):
+        assert tr._looks_like_command(text, words), text
+
+
+def test_custom_command_keywords_are_honored() -> None:
+    """用户可以追加自己插件的触发词，避免硬编码漏判。"""
+
+    assert not tr._looks_like_command("天气怎么样", tr._DEFAULT_COMMAND_KEYWORDS)
+    assert tr._looks_like_command("天气怎么样", [*tr._DEFAULT_COMMAND_KEYWORDS, "天气"])
+
+
+def test_command_keywords_config_merges_with_defaults() -> None:
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(data_dir, outbound_guard={"command_keywords": "天气, 运势"})
+        merged = plugin._command_keywords()
+        assert "随机图片" in merged  # 内置仍在
+        assert "天气" in merged and "运势" in merged
+
+
+def test_outbound_guard_can_be_disabled() -> None:
+    """总开关关闭后不应拦截任何出站，便于排查误伤。"""
+
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(
+            data_dir,
+            group_rules={"rules": "123=0"},
+            outbound_guard={"enabled": False},
+        )
+        inbound = _message_payload(group_id="123", text="闲聊")
+        _run(plugin.gate_inbound(**inbound))
+        result = _run(
+            plugin.gate_outbound(
+                stream_id=inbound["message"]["session_id"],
+                message={"session_id": inbound["message"]["session_id"],
+                         "raw_message": [{"type": "text", "data": "闲聊回复"}]},
+            )
+        )
+        assert result == {"action": "continue"}
+
+
+def test_command_window_is_configurable() -> None:
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(data_dir, outbound_guard={"command_window_seconds": 30})
+        assert plugin._command_window_seconds() == 30.0
+        # 越界值应被夹紧
+        plugin.config.outbound_guard.command_window_seconds = 99999
+        assert plugin._command_window_seconds() == 600.0
+        plugin.config.outbound_guard.command_window_seconds = 0
+        assert plugin._command_window_seconds() == 5.0
+
+
+def test_state_saved_atomically() -> None:
+    """保存后不应残留临时文件，且内容可被完整读回。"""
+
+    with _TempDir() as data_dir:
+        plugin = _make_plugin(data_dir)
+        plugin._state.overrides["123"] = 0.0
+        plugin._save_state()
+        files = [p.name for p in data_dir.iterdir()]
+        assert "state.json" in files
+        assert not [f for f in files if ".tmp-" in f], files
+
+        # 新实例应能读回
+        second = _make_plugin(data_dir)
+        second._load_state()
+        assert second._state.overrides.get("123") == 0.0
+
+
+def test_corrupt_state_is_backed_up_not_silently_dropped() -> None:
+    """回归：状态文件损坏时要留档，而不是悄悄清空用户设置。"""
+
+    with _TempDir() as data_dir:
+        (data_dir / "state.json").write_text("{ 这不是合法 JSON", encoding="utf-8")
+        plugin = _make_plugin(data_dir)
+        plugin._load_state()
+
+        assert plugin._state.overrides == {}
+        backups = [p.name for p in data_dir.iterdir() if ".corrupt-" in p.name]
+        assert backups, "损坏文件没有被留档"
 
 
 def test_third_party_command_output_is_released() -> None:

@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "github.winincorce-a11y.talk-rate",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "name": "发言频率控制",
-  "description": "把群聊回复频率精确控制到 0：可以设置某个群只有被 @ 才回复，平时的聊天内容完全不触发回复；也支持任意概率、逐群规则与热更新。",
+  "description": "把群聊回复频率精确控制到 0：可以设置某个群只有被 @ 或命中关键词才回复，平时的聊天内容完全不触发回复；支持逐群规则、关键词放行与热更新。",
   "author": {
     "name": "winincorce-a11y",
     "url": "https://github.com/winincorce-a11y"
@@ -24,7 +24,7 @@
     "max_version": "2.99.99"
   },
   "dependencies": [],
-  "plugin_type": "extension",
+  "plugin_type": "management",
   "display": {
     "icon": {
       "type": "lucide",
